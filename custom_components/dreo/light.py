@@ -45,8 +45,6 @@ def get_entries(pydreo_devices: list[PyDreoBaseDevice]) -> list[DreoLightHA]:
         if (
             isinstance(pydreo_device, PyDreoAirPurifier)
             and pydreo_device.device_definition.supports_rgbic_mode_light
-            and pydreo_device.is_feature_supported("rgbon")
-            and pydreo_device.is_feature_supported("rgbbri")
         ):
             light_ha_collection.append(Dreo530SRGBICLightHA(pydreo_device))
             continue
@@ -278,10 +276,13 @@ class DreoLightHA(DreoBaseDeviceHA, LightEntity):  # pylint: disable=abstract-me
 
 
 class Dreo530SRGBICLightHA(DreoLightHA):
-    """RGBIC controls for mode-based devices, using their catalog and observed writes.
+    """RGBIC light for DR-HAP010S (530S).
 
-    Effect labels come from DREO's cloud catalog, using the language configured in
-    the DREO app. Automations should use the names returned by that catalog.
+    Effect names are resolved only from ``rgbeffectid`` against the authenticated
+    catalog (no inference from layout ``selected`` flags or remote effects). Color
+    comes from the Constant effect ``wholeColorList`` when the reported id matches
+    that catalog entry. Firmware may report a stale scene id while another effect is
+    physically active — Home Assistant shows the reported id's catalog label.
     """
 
     INDICATOR_EFFECT = "indicator"
@@ -291,10 +292,16 @@ class Dreo530SRGBICLightHA(DreoLightHA):
         self._attr_translation_key = "rgb_light"
         self._attr_unique_id = f"{device.serial_number}-rgb-light"
         self._attr_icon = "mdi:led-strip-variant"
+        self._color_mode = ColorMode.RGB
+
+    @property
+    def rgb_color(self) -> tuple[int, int, int] | None:
+        """Whole-ring color from the catalog or a recent Home Assistant write."""
+        return self.pydreo_device.rgbic_color
 
     @property
     def supported_features(self) -> LightEntityFeature:
-        """The 530S supports selecting effects, but not free RGB color."""
+        """The 530S supports selecting effects and global RGB color."""
         return LightEntityFeature.EFFECT
 
     @property
@@ -314,21 +321,41 @@ class Dreo530SRGBICLightHA(DreoLightHA):
         return None
 
     async def async_added_to_hass(self) -> None:
-        """Load effect names and selected state from the authenticated catalog."""
+        """Load selectable effect names and persisted whole-ring color from DREO."""
         await super().async_added_to_hass()
-        manager = self.pydreo_device._dreo  # pylint: disable=protected-access
+        manager: PyDreo = self.hass.data[DOMAIN][PYDREO_MANAGER]
+        color_write_revision = self.pydreo_device.rgbic_color_write_revision
         try:
             catalog = await self.hass.async_add_executor_job(manager.get_rgbic_effect_catalog, self.pydreo_device)
         except Exception:  # pylint: disable=broad-except
             _LOGGER.exception("Unable to load RGBIC effect catalog for %s", self.pydreo_device.name)
             return
         if catalog is not None:
-            self.pydreo_device.set_rgbic_effect_catalog(catalog)
+            self.pydreo_device.set_rgbic_effect_catalog(
+                catalog,
+                expected_rgbic_color_write_revision=color_write_revision,
+            )
             self.async_write_ha_state()
 
     def turn_on(self, **kwargs: Any) -> None:
-        """Preserve on/brightness behavior, then apply a supported mode/effect."""
+        """Preserve on/brightness behavior, then apply a color or mode/effect."""
+        # The entity is registered from static model capabilities, so startup can
+        # expose it before the first state report. Avoid base-class writes until
+        # the state fields required by those setters are known.
+        if self.pydreo_device.rgbon is None or self.pydreo_device.rgbbri is None:
+            _LOGGER.debug("Ignoring 530S light command until RGB power and brightness are reported")
+            return
+        if (
+            (ATTR_EFFECT in kwargs or ATTR_RGB_COLOR in kwargs)
+            and self.pydreo_device.rgbmode is None
+        ):
+            _LOGGER.debug("Ignoring 530S RGBIC selection until rgbmode is reported")
+            return
         super().turn_on(**kwargs)
+        rgb = kwargs.get(ATTR_RGB_COLOR)
+        if rgb is not None:
+            self.pydreo_device.set_rgbic_effect(color_rgb=rgb)
+            return
         effect = kwargs.get(ATTR_EFFECT)
         if effect == self.INDICATOR_EFFECT:
             self.pydreo_device.set_rgbic_mode(1)
@@ -336,6 +363,13 @@ class Dreo530SRGBICLightHA(DreoLightHA):
             self.pydreo_device.set_rgbic_effect(effect)
         elif effect is not None:
             _LOGGER.warning("turn_on: Unknown RGBIC effect %s for %s", effect, self.pydreo_device.name)
+
+    def turn_off(self, **kwargs: Any) -> None:
+        """Avoid an off write until the device has reported its current power state."""
+        if self.pydreo_device.rgbon is None:
+            _LOGGER.debug("Ignoring 530S light off command until rgbon is reported")
+            return
+        super().turn_off(**kwargs)
 
 
 class DreoRGBLightHA(DreoLightHA):

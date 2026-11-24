@@ -516,7 +516,8 @@ class TestPyDreoAirPurifier(TestBase):
             "rgbeffectid": {"state": "1702000000000000001"},
         })
         assert device.rgbmode == 2
-        assert device.rgbeffectid == "1702000000000000001"
+        # A subsequent REST snapshot cannot replace a live WebSocket report.
+        assert device.rgbeffectid == "1701000000000000011"
 
     def test_other_purifiers_do_not_expose_530s_rgbic_writes(self):
         """The new RGBIC attributes and commands remain specific to DR-HAP010S."""
@@ -574,6 +575,254 @@ class TestPyDreoAirPurifier(TestBase):
         assert device.rgbeffectid == "1701000000000000011"
         assert isinstance(device.rgbeffectid, str)
         assert device.rgbic_effect_name is None
+
+    def test_HAP010S_repeated_constant_id_refreshes_color_and_catches_up_latest_catalog(
+        self, caplog
+    ):  # pylint: disable=invalid-name
+        """Repeated same-ID reports schedule one read and do not lose a newer event."""
+        caplog.set_level(logging.DEBUG, logger="custom_components.dreo.pydreo.pydreoairpurifier")
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+
+        def catalog_with_color(color):
+            return {"basicEffects": [{
+                "id": "2124876509150707712",
+                "referencedId": "1700000000000000001",
+                "effectType": 0,
+                "name": "Constante",
+                "layouts": [{
+                    "viewType": "SEGMENT_COLOR_LIST",
+                    "currentSelected": "whole",
+                    "wholeColorList": [color],
+                    "colorList": ["#ffffff"] * 17,
+                }],
+            }]}
+
+        device.set_rgbic_effect_catalog(catalog_with_color("#00ff00"))
+        scheduled = []
+        device._dreo.set_schedule_call_later(
+            lambda _delay, callback: scheduled.append(callback) or (lambda: None)
+        )
+        callback_colors = []
+        device.add_attr_callback(lambda: callback_colors.append(device.rgbic_color))
+        device.handle_server_update_base({
+            REPORTED_KEY: {"rgbmode": 2, "rgbeffectid": "2124876509150707712"}
+        })
+        # Repeated reports before the timer fires coalesce into that same read.
+        device.handle_server_update_base({
+            REPORTED_KEY: {"rgbeffectid": "2124876509150707712"}
+        })
+        device.handle_server_update_base({
+            REPORTED_KEY: {"rgbeffectid": "2124876509150707712"}
+        })
+        assert len(scheduled) == 1
+
+        reads = []
+
+        def get_catalog(_device):
+            reads.append(True)
+            if len(reads) == 1:
+                # A second report repeats the same ID while the first GET is in flight.
+                device.handle_server_update_base({
+                    REPORTED_KEY: {"rgbeffectid": "2124876509150707712"}
+                })
+                return catalog_with_color("#00ff00")
+            return catalog_with_color("#ff020a")
+
+        with patch.object(device._dreo, "get_rgbic_effect_catalog", side_effect=get_catalog):
+            scheduled[0]()
+            assert device._rgbic_catalog_refresh_cancel is None
+            assert device._rgbic_catalog_refresh_running is False
+
+            # A later same-ID report must start a new refresh after the prior one ended.
+            device.handle_server_update_base({
+                REPORTED_KEY: {"rgbeffectid": "2124876509150707712"}
+            })
+            assert len(scheduled) == 2
+            scheduled[1]()
+
+        assert len(reads) == 3
+        assert device.rgbeffectid == "2124876509150707712"
+        assert device.rgbic_color == (255, 2, 10)
+        assert callback_colors[-1] == (255, 2, 10)
+        assert "Received 530S RGBIC rgbeffectid report=2124876509150707712 changed=False" in caplog.text
+        assert "RGBIC catalog color refreshed from DREO RGB=(255, 2, 10)" in caplog.text
+
+    def test_HAP010S_catalog_refresh_releases_handle_after_api_error(self):  # pylint: disable=invalid-name
+        """A failed read clears the pending handle so a later report can retry once."""
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        catalog = {"basicEffects": [{
+            "id": "constant-id",
+            "referencedId": "constant-ref",
+            "effectType": 0,
+            "name": "Constante",
+            "layouts": [{
+                "viewType": "SEGMENT_COLOR_LIST",
+                "currentSelected": "whole",
+                "wholeColorList": ["#0066ff"],
+                "colorList": ["#ffffff"] * 17,
+            }],
+        }]}
+        device.set_rgbic_effect_catalog(catalog)
+        scheduled = []
+        device._dreo.set_schedule_call_later(
+            lambda _delay, callback: scheduled.append(callback) or (lambda: None)
+        )
+        device.handle_server_update_base({
+            REPORTED_KEY: {"rgbmode": 2, "rgbeffectid": "constant-id"}
+        })
+
+        with patch.object(
+            device._dreo,
+            "get_rgbic_effect_catalog",
+            side_effect=[RuntimeError("catalog unavailable"), catalog],
+        ) as get_catalog:
+            scheduled[0]()
+            assert device._rgbic_catalog_refresh_cancel is None
+            assert device._rgbic_catalog_refresh_running is False
+
+            device.handle_server_update_base({
+                REPORTED_KEY: {"rgbeffectid": "constant-id"}
+            })
+            assert len(scheduled) == 2
+            scheduled[1]()
+
+        assert get_catalog.call_count == 2
+        assert device.rgbic_color == (0, 102, 255)
+        assert device._rgbic_catalog_refresh_cancel is None
+        assert device._rgbic_catalog_refresh_running is False
+
+    def test_HAP010S_stale_catalog_read_cannot_overwrite_newer_local_rgb_write(self):  # pylint: disable=invalid-name
+        """An in-flight app refresh cannot replace a newer successful HA color write."""
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        catalog = {"basicEffects": [{
+            "id": "constant-id",
+            "referencedId": "constant-ref",
+            "effectType": 0,
+            "name": "Constante",
+            "layouts": [{
+                "viewType": "SEGMENT_COLOR_LIST",
+                "currentSelected": "whole",
+                "wholeColorList": ["#00ff00"],
+                "colorList": ["#ffffff"] * 17,
+            }],
+        }]}
+        device.set_rgbic_effect_catalog(catalog)
+        scheduled = []
+        device._dreo.set_schedule_call_later(
+            lambda _delay, callback: scheduled.append(callback) or (lambda: None)
+        )
+        device.handle_server_update_base({
+            REPORTED_KEY: {"rgbmode": 2, "rgbeffectid": "constant-id"}
+        })
+
+        def stale_read(_device):
+            assert device.set_rgbic_effect(color_rgb=(255, 255, 255)) is True
+            return catalog
+
+        with patch.object(device._dreo, "get_rgbic_effect_catalog", side_effect=stale_read), patch.object(
+            device._dreo, "set_rgbic_effect", return_value=True
+        ):
+            scheduled[0]()
+
+        assert device.rgbic_color == (255, 255, 255)
+
+    @pytest.mark.parametrize(
+        ("effect_id", "rgb_mode"),
+        [("unrecognized-effect", 2), (None, None)],
+    )
+    def test_HAP010S_catalog_recovers_persisted_color_without_matching_state(
+        self, effect_id, rgb_mode
+    ):  # pylint: disable=invalid-name
+        """A successful catalog read recovers Constant color even without active-state fields."""
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        device._rgbeffectid = effect_id
+        device._rgbmode = rgb_mode
+
+        device.set_rgbic_effect_catalog({"basicEffects": [{
+            "id": "constant-catalog-id",
+            "referencedId": "constant-resource-id",
+            "effectType": 0,
+            "name": "Constante",
+            "layouts": [{
+                "viewType": "SEGMENT_COLOR_LIST",
+                "currentSelected": "whole",
+                "wholeColorList": ["#0066ff"],
+                "colorList": ["#ffffff"] * 17,
+            }],
+        }]})
+
+        assert device.rgbic_color == (0, 102, 255)
+
+    def test_HAP010S_initial_catalog_read_does_not_replace_newer_ha_color(self):  # pylint: disable=invalid-name
+        """Initial catalog response is ignored for RGB if HA wrote a color during its request."""
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        device._rgbmode = 2
+        catalog = {"basicEffects": [{
+            "id": "constant-catalog-id",
+            "referencedId": "constant-resource-id",
+            "effectType": 0,
+            "name": "Constante",
+            "layouts": [{
+                "viewType": "SEGMENT_COLOR_LIST",
+                "currentSelected": "whole",
+                "wholeColorList": ["#0066ff"],
+                "colorList": ["#ffffff"] * 17,
+            }],
+        }]}
+        device.set_rgbic_effect_catalog(catalog)
+        stale_read_revision = device.rgbic_color_write_revision
+
+        with patch.object(device._dreo, "set_rgbic_effect", return_value=True):
+            assert device.set_rgbic_effect(color_rgb=(255, 0, 0)) is True
+
+        device.set_rgbic_effect_catalog(
+            catalog,
+            expected_rgbic_color_write_revision=stale_read_revision,
+        )
+        assert device.rgbic_color == (255, 0, 0)
+
+    def test_HAP010S_non_constant_effect_report_does_not_refresh_catalog(self):  # pylint: disable=invalid-name
+        """Catalog color refreshes are scoped to the structurally identified Constant effect."""
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        device.set_rgbic_effect_catalog({
+            "basicEffects": [{
+                "id": "constant-id",
+                "referencedId": "constant-ref",
+                "effectType": 0,
+                "name": "Constante",
+                "layouts": [{
+                    "viewType": "SEGMENT_COLOR_LIST",
+                    "currentSelected": "whole",
+                    "wholeColorList": ["#00ff00"],
+                }],
+            }, {
+                "id": "contrast-id",
+                "referencedId": "contrast-ref",
+                "effectType": 0,
+                "name": "Contraste",
+                "layouts": [],
+            }],
+        })
+        scheduled = []
+        device._dreo.set_schedule_call_later(
+            lambda _delay, callback: scheduled.append(callback) or (lambda: None)
+        )
+
+        device.handle_server_update_base({REPORTED_KEY: {"rgbeffectid": "contrast-id"}})
+
+        assert scheduled == []
 
     def test_HAP010S_catalog_id_matches_websocket_id_not_referenced_id(self):  # pylint: disable=invalid-name
         """The 530S uses catalog id; the response's English name is not displayed."""
@@ -836,3 +1085,62 @@ class TestPyDreoAirPurifier(TestBase):
 
         assert device.rgbic_effect_name == selected_name
         assert device._rgbic_effect_pending is False
+
+    @pytest.mark.parametrize(
+        ("rgb", "expected_hex"),
+        [((255, 0, 0), "#ff0000"), ((0, 0, 255), "#0000ff"), ((255, 255, 255), "#ffffff")],
+    )
+    def test_HAP010S_rgb_color_updates_only_catalog_whole_color_list(
+        self, rgb, expected_hex
+    ):  # pylint: disable=invalid-name
+        """Global RGB color uses localized catalog IDs and preserves all segment colors."""
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        color_list = [f"#{index:02x}{index:02x}{index:02x}" for index in range(17)]
+        constant = {
+            "id": "catalog-constant-id",
+            "referencedId": "catalog-constant-resource",
+            "effectType": 0,
+            "name": "Luz constante",
+            "selected": False,
+            "layouts": [{
+                "currentSelected": "whole",
+                "wholeColorList": ["#123456"],
+                "colorList": color_list,
+                "effectParamKey": "colors",
+                "viewType": "SEGMENT_COLOR_LIST",
+            }],
+        }
+        catalog = {"basicEffects": [constant], "sceneEffects": []}
+        device.set_rgbic_effect_catalog(catalog)
+        device.handle_server_update({REPORTED_KEY: {"rgbmode": 2}})
+        posted = []
+
+        def fake_send(dev, params):
+            _ack_control_send(self.pydreo_manager, dev, params)
+
+        def fake_call_api(_url, api, _method, payload, _headers):
+            if api == "/api/device/rgb-effect/all/list":
+                return {"code": 0, "data": catalog}, 200
+            if api == "/api/device/rgb-effect/edit/batch":
+                posted.extend(payload)
+                return {"code": 0, "data": {}}, 200
+            return None, 500
+
+        with patch(PATCH_SEND_COMMAND, side_effect=fake_send), patch(
+            "custom_components.dreo.pydreo.Helpers.call_api", side_effect=fake_call_api
+        ):
+            assert device.set_rgbic_effect(color_rgb=rgb) is True
+
+        entry = posted[0]
+        assert entry["name"] == "Luz constante"
+        assert entry["id"] == "catalog-constant-id"
+        assert entry["subEffects"][0]["effectId"] == "catalog-constant-resource"
+        layout = entry["subEffects"][0]["layouts"][0]
+        assert layout["wholeColorList"] == [expected_hex]
+        assert layout["colorList"] == color_list
+        assert len(layout["colorList"]) == 17
+        assert layout["currentSelected"] == "whole"
+        assert device.rgbic_effect_name == "Luz constante"
+        assert device.rgbic_color == rgb
