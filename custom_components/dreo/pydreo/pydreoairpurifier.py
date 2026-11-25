@@ -167,9 +167,7 @@ class PyDreoAirPurifier(PyDreoFanBase):
             with self._lock:
                 self._rgbic_color_write_revision += 1
                 self._rgbic_color = None
-        elif not self._rgbic_effect_pending and not (
-            self._rgbic_effect_name in self.rgbic_selectable_effect_names
-        ):
+        elif not self._rgbic_effect_pending and self._rgbic_effect_name not in self.rgbic_selectable_effect_names:
             self._rgbic_effect_name = None
         self._do_callbacks()
 
