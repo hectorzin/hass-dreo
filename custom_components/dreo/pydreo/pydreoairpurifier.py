@@ -292,7 +292,13 @@ class PyDreoAirPurifier(PyDreoFanBase):
         """Basic and scene effect names exposed to Home Assistant."""
         names = [*self._rgbic_effect_names, *self._rgbic_scene_effect_names]
         if self._rgbic_segments_supported and self._rgbic_color_effect_name:
-            names.append(f"{self._rgbic_color_effect_name} (segments)")
+            variant = f"{self._rgbic_color_effect_name} (segments)"
+            try:
+                constant_index = names.index(self._rgbic_color_effect_name)
+            except ValueError:
+                names.append(variant)
+            else:
+                names.insert(constant_index + 1, variant)
         return names
 
     @property
@@ -300,8 +306,16 @@ class PyDreoAirPurifier(PyDreoFanBase):
         """Catalog label for the current ``rgbeffectid``, when exactly known."""
         if (self._rgbic_color_mode == "segments" and self._rgbeffectid == self._rgbic_color_effect_id
                 and self._rgbmode != 1):
-            return f"{self._rgbic_color_effect_name} (segments)"
-        return self._rgbic_effect_name
+            exposed_name = f"{self._rgbic_color_effect_name} (segments)"
+        else:
+            exposed_name = self._rgbic_effect_name
+        _LOGGER.debug(
+            "RGBIC effect exposed to Home Assistant: effect=%s rgbeffectid=%s color_mode=%s",
+            exposed_name,
+            self._rgbeffectid,
+            self._rgbic_color_mode,
+        )
+        return exposed_name
 
     @property
     def rgbic_color(self) -> tuple[int, int, int] | None:
@@ -340,6 +354,21 @@ class PyDreoAirPurifier(PyDreoFanBase):
             isinstance(layout, dict)
             and layout.get("viewType") == "SEGMENT_COLOR_LIST"
             and "wholeColorList" in layout
+        )
+
+    @staticmethod
+    def _rgbic_segment_color_list_valid(layout: object) -> bool:
+        """True when a layout has a non-empty list of valid segment colors."""
+        if not isinstance(layout, dict):
+            return False
+        colors = layout.get("colorList")
+        return (
+            isinstance(colors, list)
+            and bool(colors)
+            and all(
+                isinstance(color, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", color) is not None
+                for color in colors
+            )
         )
 
     @staticmethod
@@ -447,7 +476,7 @@ class PyDreoAirPurifier(PyDreoFanBase):
             self._rgbic_color_effect_id = str(color_effect["id"]) if color_effect else None
             color_layout = next((layout for layout in (color_effect or {}).get("layouts", [])
                                  if self._rgbic_whole_color_layout(layout)), {})
-            self._rgbic_segments_supported = isinstance(color_layout.get("colorList"), list)
+            self._rgbic_segments_supported = self._rgbic_segment_color_list_valid(color_layout)
             self._rgbic_effect_catalog_loaded = True
             self._rgbic_effect_name = self._rgbic_effect_id_to_name.get(self._rgbeffectid)
             constant_active = (
@@ -461,6 +490,13 @@ class PyDreoAirPurifier(PyDreoFanBase):
             if self._rgbic_color_mode == "segments":
                 self._rgbic_color = None
             applied_color = self._rgbic_color
+
+        _LOGGER.debug(
+            "RGBIC catalog processed: currentSelected=%s color_mode=%s effect_id=%s",
+            color_layout.get("currentSelected"),
+            self._rgbic_color_mode,
+            self._rgbic_color_effect_id,
+        )
 
         if constant_active and applied_color is not None:
             _LOGGER.debug("RGBIC catalog color refreshed from DREO RGB=%s", applied_color)
@@ -569,9 +605,13 @@ class PyDreoAirPurifier(PyDreoFanBase):
         requested_color: tuple[int, int, int] | None = None
         color_hex: str | None = None
         current_selected: str | None = None
+        requested_effect_name = effect_name
         with self._lock:
-            if effect_name and effect_name.endswith(" (segments)"):
-                effect_name = effect_name[:-11]
+            if (
+                self._rgbic_color_effect_name
+                and effect_name == f"{self._rgbic_color_effect_name} (segments)"
+            ):
+                effect_name = self._rgbic_color_effect_name
                 current_selected = "segments"
             elif effect_name == self._rgbic_color_effect_name:
                 current_selected = "whole"
@@ -591,6 +631,10 @@ class PyDreoAirPurifier(PyDreoFanBase):
 
             if effect_name is None:
                 return False
+            _LOGGER.debug(
+                "RGBIC effect requested from Home Assistant: effect=%s",
+                requested_effect_name or effect_name,
+            )
             if current_selected == "segments" and not self._rgbic_segments_supported:
                 return False
             write_effect_name = effect_name
@@ -627,6 +671,8 @@ class PyDreoAirPurifier(PyDreoFanBase):
                     self._rgbic_color = None
                 elif requested_color is None and write_effect_name == self._rgbic_color_effect_name:
                     self._rgbic_color = self._rgbic_whole_color
+            else:
+                self._rgbic_color_mode = None
             if requested_color is not None:
                 self._rgbic_whole_color = requested_color
             self._skip_next_constant_refresh = time.monotonic() + 5 if requested_color is not None else None
@@ -707,6 +753,7 @@ class PyDreoAirPurifier(PyDreoFanBase):
                 self._apply_rgbic_mode_locked(val_rgbmode, authoritative=True)
             if isinstance(val_effect_id, (str, int)) and not isinstance(val_effect_id, bool):
                 val_effect_id = str(val_effect_id)
+                _LOGGER.debug("RGBIC WebSocket report received: rgbeffectid=%s", val_effect_id)
                 was_reported = self._rgbic_effect_id_reported
                 changed = val_effect_id != self._rgbeffectid
                 self._rgbeffectid = val_effect_id

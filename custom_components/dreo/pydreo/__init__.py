@@ -30,6 +30,21 @@ from .pydreoevaporativecooler import PyDreoEvaporativeCooler
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _rgbic_current_selected_values(value: object) -> list[object]:
+    """Extract only currentSelected values from an RGBIC API payload."""
+    selected: list[object] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "currentSelected":
+                selected.append(item)
+            else:
+                selected.extend(_rgbic_current_selected_values(item))
+    elif isinstance(value, list):
+        for item in value:
+            selected.extend(_rgbic_current_selected_values(item))
+    return selected
+
 _COMMAND_ACK_TIMEOUT = 2  # seconds to wait for server to confirm command
 _ACK_METHOD_NAMES = {"control-report", "control-reply"}  # consider fast server reply and later device confirmation as ack
 _MAX_COMMAND_RETRIES = 2  # retry failed commands up to this many times
@@ -475,6 +490,11 @@ class PyDreo:  # pylint: disable=function-redefined
             {"devicesn": device.serial_number},  # RGBIC API expects lowercase, not deviceSn
             header_overrides={"lang": "es", "country": "ES", "appversion": "3.8.2"},
         )
+        _LOGGER.debug(
+            "RGBIC catalog GET result for %s: currentSelected=%s",
+            device.name,
+            _rgbic_current_selected_values(response) or None,
+        )
         if status_code != 200 or not isinstance(response, dict) or response.get("code") != 0:
             _LOGGER.warning(
                 "get_rgbic_effect_catalog: request failed for %s status=%s response=%s",
@@ -558,10 +578,21 @@ class PyDreo:  # pylint: disable=function-redefined
 
     def _post_rgbic_edit_batch(self, device: PyDreoBaseDevice, payload: list) -> bool:
         """POST a prepared edit/batch payload using the existing authenticated client."""
+        _LOGGER.debug(
+            "RGBIC edit/batch POST for %s: currentSelected_sent=%s",
+            device.name,
+            _rgbic_current_selected_values(payload) or None,
+        )
         response, status_code = self._call_authenticated_api(
             "/api/device/rgb-effect/edit/batch",
             "post",
             payload,
+        )
+        _LOGGER.debug(
+            "RGBIC edit/batch POST response for %s: status=%s currentSelected_returned=%s",
+            device.name,
+            status_code,
+            _rgbic_current_selected_values(response) or None,
         )
         if status_code != 200 or not isinstance(response, dict) or response.get("code") != 0:
             _LOGGER.warning(
