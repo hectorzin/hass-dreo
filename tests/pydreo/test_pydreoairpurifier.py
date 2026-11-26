@@ -2549,3 +2549,25 @@ class TestPyDreoAirPurifier(TestBase):
         assert layout["currentSelected"] == "whole"
         assert device.rgbic_effect_name == "Luz constante"
         assert device.rgbic_color == rgb
+
+    def test_segments_effect_payload_uses_original_catalog_identity_and_preserves_colors(self):
+        self.get_devices_file_name = "get_devices_HAP010S.json"
+        self.pydreo_manager.load_devices()
+        device = self.pydreo_manager.devices[0]
+        segment_colors = ["#110022", "#220044"]
+        effect = {
+            "id": "constant-id", "referencedId": "constant-ref", "effectType": 0,
+            "name": "Constante", "layouts": [{
+                "viewType": "SEGMENT_COLOR_LIST", "currentSelected": "whole",
+                "wholeColorList": ["#abcdef"], "colorList": segment_colors,
+            }],
+        }
+        entry = self.pydreo_manager._prepare_rgbic_edit_batch_entry(
+            device, effect, effect_name="Constante", current_selected="segments"
+        )
+        assert entry["id"] == "constant-id"
+        assert entry["name"] == "Constante"
+        layout = entry["subEffects"][0]["layouts"][0]
+        assert layout["currentSelected"] == "segments"
+        assert layout["wholeColorList"] == ["#abcdef"]
+        assert layout["colorList"] == segment_colors
